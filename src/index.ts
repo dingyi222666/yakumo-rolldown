@@ -96,7 +96,8 @@ function externalPlugin({
         if (/^[@\w]/.test(id)) {
           // bare specifier
           if (isAbsolute(id)) return null;
-          if (isBuiltin(id)) return { id, external: true };
+          // Side-effect free, or the node platform's unused require shim leaves a bare `import "node:module"`.
+          if (isBuiltin(id)) return { id, external: true, moduleSideEffects: false };
           const name = id.startsWith("@") ? id.split("/", 2).join("/") : id.split("/", 1)[0];
           if (name === manifest.name) return { id, external: true };
           const types = new Set(DependencyType.filter((type) => manifest[type]?.[name]));
@@ -198,7 +199,7 @@ async function buildPackage(
       const srcExt = extname(target);
       const entry = target.slice(0, -srcExt.length);
       const outFile = join(outdir, entry + outExt);
-      if (outFiles.has(outFile)) return;
+      if (outFiles.has(outFile)) continue;
       outFiles.add(outFile);
       if (!preset.platform) {
         (exports[srcFile] ||= {}).types = `${manifest.name}/${prefix}`;
@@ -207,6 +208,8 @@ async function buildPackage(
       }
       matrix.push({
         input: { [entry]: srcFile },
+        // Without it rolldown defaults to `browser` and inlines `process.env.NODE_ENV`.
+        platform: preset.platform ?? "node",
         plugins: [
           yamlPlugin(),
           externalPlugin({ manifest, exports, currentEntry: srcFile, format: preset.format }),
@@ -225,26 +228,28 @@ async function buildPackage(
     }
   }
 
-  function addConditionalExport(pattern: any, preset: any, prefix = "") {
+  async function addConditionalExport(pattern: any, preset: any, prefix = ""): Promise<void> {
     if (typeof pattern === "string") {
       return addExport(pattern, preset, prefix);
     }
-    for (const key in pattern) {
-      if (key === "require")
-        addConditionalExport(pattern[key], { ...preset, format: "cjs" }, prefix);
-      else if (key === "import")
-        addConditionalExport(pattern[key], { ...preset, format: "esm" }, prefix);
-      else if (["browser", "node"].includes(key))
-        addConditionalExport(pattern[key], { ...preset, platform: key }, prefix);
-      else if (["types", "typings"].includes(key))
-        addConditionalExport(pattern[key], { ...preset, platform: undefined }, prefix);
-      else
-        addConditionalExport(
+    // Every entry must be registered before the matrix is built, or subpath exports are silently skipped.
+    await Promise.all(
+      Object.keys(pattern ?? {}).map((key) => {
+        if (key === "require")
+          return addConditionalExport(pattern[key], { ...preset, format: "cjs" }, prefix);
+        if (key === "import")
+          return addConditionalExport(pattern[key], { ...preset, format: "esm" }, prefix);
+        if (["browser", "node"].includes(key))
+          return addConditionalExport(pattern[key], { ...preset, platform: key }, prefix);
+        if (["types", "typings"].includes(key))
+          return addConditionalExport(pattern[key], { ...preset, platform: undefined }, prefix);
+        return addConditionalExport(
           pattern[key],
           preset,
           key.startsWith(".") ? join(prefix, key) : prefix,
         );
-    }
+      }),
+    );
   }
 
   const preset = {
@@ -254,7 +259,7 @@ async function buildPackage(
   const tasks: Promise<void>[] = [];
   tasks.push(addExport(manifest.main, preset));
   tasks.push(addExport(manifest.module, { ...preset, format: "esm" }));
-  addConditionalExport(manifest.exports, preset);
+  tasks.push(addConditionalExport(manifest.exports, preset));
   if (!manifest.exports) {
     tasks.push(addExport("package.json", preset, ""));
   }
@@ -270,20 +275,21 @@ async function buildPackage(
   const build =
     buildCallback ??
     ((options: BuildRequest, callback: (opts: BuildRequest) => Promise<void>) => callback(options));
-  await Promise.all(
-    matrix.map(async (options) => {
-      try {
-        await build(options, async (opts) => {
-          const { plugins, output, ...rest } = opts;
-          const bundle = await rolldown({ ...rest, plugins } as InputOptions);
-          await bundle.write(output as OutputOptions);
-          await bundle.close();
-        });
-      } catch (error) {
-        console.error(error);
-      }
-    }),
+  const results = await Promise.allSettled(
+    matrix.map((options) =>
+      build(options, async (opts) => {
+        const { plugins, output, ...rest } = opts;
+        const bundle = await rolldown({ ...rest, plugins } as InputOptions);
+        await bundle.write(output as OutputOptions);
+        await bundle.close();
+      }),
+    ),
   );
+  const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+  if (errors.length) {
+    for (const error of errors) console.error(error);
+    throw new Error(`${manifest.name}: ${errors.length} rolldown build(s) failed`);
+  }
 }
 
 export function apply(ctx: Context, config: Config) {
